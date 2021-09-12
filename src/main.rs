@@ -1,7 +1,9 @@
 use log::info;
 use std::cmp;
+use std::time::Instant;
 
 use serde::Serialize;
+use test_env_log::test;
 
 /// In memory btree implementation
 /// Btree has 2 types of nodes: Leaf nodes that contain values and branch nodes that branch to leaf or branch nodes based on keys.
@@ -16,7 +18,7 @@ enum BtreeError<K, V> {
     NodeSplit(K, Node<K, V>),
 }
 
-trait NodeKeyType: cmp::Ord + Clone + std::fmt::Display + std::fmt::Debug {}
+pub trait NodeKeyType: cmp::Ord + Clone + std::fmt::Display + std::fmt::Debug {}
 
 impl<T: cmp::Ord + Clone + std::fmt::Display + std::fmt::Debug> NodeKeyType for T {}
 
@@ -55,15 +57,8 @@ impl<K: NodeKeyType, V> LeafNode<K, V> {
     fn max_key(&self) -> &K {
         &self.keys[self.keys.len() - 1]
     }
-    fn insert(&mut self, key: K, value: V) -> Result<(), BtreeError<K, V>> {
-        match self.keys.binary_search(&key) {
-            Ok(index) => self.values[index] = value,
-            Err(index) => {
-                self.keys.insert(index, key);
-                self.values.insert(index, value);
-            }
-        }
 
+    fn maybe_split(&mut self) -> Result<(), BtreeError<K, V>> {
         if self.keys.len() == self.branch_factor {
             info!("splitting at keys len = {}", self.keys.len());
             let mut split_node = LeafNode::new(self.branch_factor);
@@ -83,6 +78,17 @@ impl<K: NodeKeyType, V> LeafNode<K, V> {
         } else {
             Ok(())
         }
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Result<(), BtreeError<K, V>> {
+        match self.keys.binary_search(&key) {
+            Ok(index) => self.values[index] = value,
+            Err(index) => {
+                self.keys.insert(index, key);
+                self.values.insert(index, value);
+            }
+        }
+        self.maybe_split()
     }
 }
 
@@ -105,6 +111,21 @@ impl<K: NodeKeyType, V> BranchNode<K, V> {
 
     fn max_key(&self) -> &K {
         &self.keys[self.keys.len() - 1]
+    }
+
+    fn maybe_split(&mut self) -> Result<(), BtreeError<K, V>> {
+        if self.keys.len() == self.branch_factor {
+            let mut split_node = BranchNode::new(self.branch_factor);
+            let mid = self.keys.len() / 2;
+            split_node.keys = self.keys.split_off(mid + 1);
+            split_node.children = self.children.split_off(mid + 1);
+            Err(BtreeError::NodeSplit(
+                self.keys.remove(mid),
+                Node::Branch(split_node),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn insert(&mut self, key: K, value: V) -> Result<(), BtreeError<K, V>> {
@@ -144,39 +165,27 @@ impl<K: NodeKeyType, V> BranchNode<K, V> {
                 self.children.push(split_node);
             }
         }
-        if self.keys.len() == self.branch_factor {
-            let mut split_node = BranchNode::new(self.branch_factor);
-            let mid = self.keys.len() / 2;
-            split_node.keys = self.keys.split_off(mid + 1);
-            split_node.children = self.children.split_off(mid + 1);
-            Err(BtreeError::NodeSplit(
-                self.keys.remove(mid),
-                Node::Branch(split_node),
-            ))
-        } else {
-            Ok(())
-        }
+        self.maybe_split()
     }
 }
 
-struct BTree<K: cmp::Ord, V> {
+pub struct BTree<K: cmp::Ord, V> {
     root: std::cell::Cell<Node<K, V>>,
-    branch_factor: usize, // 2*B
+    branch_factor: usize, // 2*B - 1
 }
 
-#[cfg(test)]
 impl<K: NodeKeyType, V> BTree<K, V> {
-    fn new(B: usize) -> Self {
-        if B < 2 {
+    pub fn new(b: usize) -> Self {
+        if b < 2 {
             panic!("{}", "B must be at least 2");
         }
-        let branch_factor = 2 * B - 1;
+        let branch_factor = 2 * b - 1;
         BTree {
             root: std::cell::Cell::new(Node::Leaf(LeafNode::new(branch_factor))),
             branch_factor,
         }
     }
-    fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&mut self, key: K, value: V) {
         match self.root.get_mut().insert(key, value) {
             Ok(_) => (),
             Err(BtreeError::NodeSplit(key, split_node)) => {
@@ -216,7 +225,16 @@ fn btree_first_node() {
     );
 }
 fn main() {
-    println!("Hello, world!");
+    let mut bt = BTree::<i32, i32>::new(128);
+    for i in 1..1000_000 {
+        bt.insert(i, i);
+    }
+    let before = Instant::now();
+    let mut bt1 = BTree::<i32, i32>::new(128);
+    for i in 1..1000_000 {
+        bt1.insert(i, i);
+    }
+    println!("elapsed = {} micros", before.elapsed().as_micros());
 }
 
 #[test]
@@ -266,10 +284,4 @@ fn vec_binary_search() {
     assert_eq!(Err(1), v.binary_search(&11));
     assert_eq!(Ok(1), v.binary_search(&100));
     assert_eq!(Err(2), v.binary_search(&200));
-}
-
-#[test]
-fn vec_init_with_length() {
-    let y: usize = 8;
-    let v = vec![-1; y];
 }
