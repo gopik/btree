@@ -182,14 +182,14 @@ impl<K: NodeKeyType, V> LeafNode<K, V> {
                     Ok(value)
                 }
             }
-            Err(index) => Err(BtreeError::KeyNotFound),
+            Err(_) => Err(BtreeError::KeyNotFound),
         }
     }
 
     fn find(&self, key: &K) -> Result<&V, BtreeError<K, V>> {
         match self.keys.binary_search(key) {
             Ok(index) => Ok(&self.values[index]),
-            Err(index) => Err(BtreeError::KeyNotFound),
+            Err(_) => Err(BtreeError::KeyNotFound),
         }
     }
 }
@@ -275,12 +275,14 @@ impl<K: NodeKeyType, V> BranchNode<K, V> {
     }
 
     fn find(&self, key: &K) -> Result<&V, BtreeError<K, V>> {
-        Err(BtreeError::KeyNotFound)
+        match self.keys.binary_search(key) {
+            Ok(index) | Err(index) => self.children[index].find(key),
+        }
     }
 }
 
 pub struct BTree<K: cmp::Ord, V> {
-    root: std::cell::Cell<Node<K, V>>,
+    root: Node<K, V>,
     branch_factor: usize, // 2*B - 1
 }
 
@@ -291,17 +293,17 @@ impl<K: NodeKeyType, V> BTree<K, V> {
         }
         let branch_factor = 2 * b - 1;
         BTree {
-            root: std::cell::Cell::new(Node::Leaf(LeafNode::new(branch_factor))),
+            root: Node::Leaf(LeafNode::new(branch_factor)),
             branch_factor,
         }
     }
     pub fn insert(&mut self, key: K, value: V) {
-        match self.root.get_mut().insert(key, value) {
+        match self.root.insert(key, value) {
             Ok(_) => (),
             Err(BtreeError::NodeSplit(key, split_node)) => {
                 let branch_node = BranchNode::<K, V>::new(self.branch_factor);
-                let old_root = self.root.replace(Node::Branch(branch_node));
-                let new_root = self.root.get_mut();
+                let old_root = std::mem::replace(&mut self.root, Node::Branch(branch_node));
+                let new_root = &mut self.root;
                 if let Node::Branch(ref mut node) = new_root {
                     // Every branch node maintains an invariant that it has m keys and
                     // m+1 children.
@@ -312,6 +314,9 @@ impl<K: NodeKeyType, V> BTree<K, V> {
             }
             _ => (),
         }
+    }
+    pub fn find(&self, key: &K) -> Option<&V> {
+        self.root.find(key).ok()
     }
 }
 
@@ -367,13 +372,42 @@ fn branch_split() {
     btree.insert(2, 2);
     btree.insert(3, 3); // splits into a branch node
 
-    let mut root_node = btree.root.replace(Node::Leaf(LeafNode::new(4)));
+    let mut root_node = std::mem::replace(&mut btree.root, Node::Leaf(LeafNode::new(4)));
     let branch_node = match root_node {
         Node::Branch(ref mut b) => b,
         _ => panic!("unexpected node type"),
     };
     branch_node.insert(4, 4).ok(); // leaf node splits and branch is full
     let ret = branch_node.insert(5, 5); // should split branch node
+    match ret {
+        Ok(_) => panic!("expected error with branch split, got ok"),
+        Err(BtreeError::NodeSplit(k, Node::Branch(node))) => {
+            assert_eq!(2, k);
+            assert_eq!(node.keys.len(), 1);
+            assert_eq!(node.children.len(), 2);
+            assert_eq!(node.keys, vec![3]);
+        }
+        a @ _ => panic!("unecpected return value {:?}", a),
+    }
+}
+
+#[test]
+fn branch_find() {
+    let mut btree: BTree<i32, i32> = BTree::new(2);
+    btree.insert(1, 1);
+    btree.insert(2, 2);
+    btree.insert(3, 3); // splits into a branch node
+
+    let mut root_node = std::mem::replace(&mut btree.root, Node::Leaf(LeafNode::new(4)));
+    let branch_node = match root_node {
+        Node::Branch(ref mut b) => b,
+        _ => panic!("unexpected node type"),
+    };
+    branch_node.insert(4, 4).ok(); // leaf node splits and branch is full
+
+    assert!(branch_node.find(&5).is_err());
+    assert_eq!(BtreeError::KeyNotFound, branch_node.find(&5).err().unwrap());
+    assert_eq!(&2, branch_node.find(&2).ok().unwrap());
 }
 
 fn main() {
@@ -406,7 +440,7 @@ fn btree_branch_split() {
         "{\"Branch\":{\"keys\":[\"four\",\"seven\"],\"children\":[{\"Leaf\":{\"keys\":[\"eight\",\"five\",\"four\"]}},{\"Leaf\":{\"keys\":[\"nine\",\"one\",\"seven\"]}},{\"Leaf\":{\"keys\":[\"six\",\"three\",\"two\"]}}]}}",
         format!(
             "{}",
-            serde_json::to_string(btree.root.get_mut()).ok().unwrap()
+            serde_json::to_string(&btree.root).ok().unwrap()
         )
     )
 }
