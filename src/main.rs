@@ -83,6 +83,14 @@ enum BtreeError<K, V> {
     KeyNotFound,
 }
 
+// Represents internal state of a node associated with key K
+// Leaf has a value for K and a branch node has associated
+// child (could be left or right)
+enum KV<K, V> {
+    Leaf(K, V),
+    Branch(K, Node<K, V>),
+}
+
 #[derive(Debug, Serialize, PartialEq)]
 enum Node<K, V> {
     Branch(BranchNode<K, V>),
@@ -92,27 +100,60 @@ enum Node<K, V> {
 impl<K: NodeKeyType, V> Node<K, V> {
     fn insert(&mut self, key: K, value: V) -> Result<(), BtreeError<K, V>> {
         match self {
-            Self::Branch(ref mut b) => b.insert(key, value),
-            Self::Leaf(ref mut l) => l.insert(key, value),
+            Self::Branch(b) => b.insert(key, value),
+            Self::Leaf(l) => l.insert(key, value),
         }
     }
     fn max_key(&self) -> &K {
         match self {
-            Self::Branch(ref b) => b.max_key(),
-            Self::Leaf(ref l) => l.max_key(),
+            Self::Branch(b) => b.max_key(),
+            Self::Leaf(l) => l.max_key(),
         }
     }
     fn remove_key(&mut self, key: &K) -> Result<V, BtreeError<K, V>> {
         match self {
-            Self::Branch(ref mut branch) => branch.remove_key(key),
-            Self::Leaf(ref mut leaf) => leaf.remove_key(key),
+            Self::Branch(branch) => branch.remove_key(key),
+            Self::Leaf(leaf) => leaf.remove_key(key),
         }
     }
 
     fn find(&self, key: &K) -> Result<&V, BtreeError<K, V>> {
         match self {
-            Self::Branch(ref branch) => branch.find(key),
-            Self::Leaf(ref leaf) => leaf.find(key),
+            Self::Branch(branch) => branch.find(key),
+            Self::Leaf(leaf) => leaf.find(key),
+        }
+    }
+
+    fn num_keys(&self) -> usize {
+        match self {
+            Self::Branch(branch) => branch.num_keys(),
+            Self::Leaf(leaf) => leaf.num_keys(),
+        }
+    }
+
+    fn remove_max(&mut self) -> KV<K, V> {
+        match self {
+            Self::Branch(branch) => {
+                let (k, c) = branch.remove_max();
+                KV::Branch(k, c)
+            }
+            Self::Leaf(leaf) => {
+                let (k, v) = leaf.remove_max();
+                KV::Leaf(k, v)
+            }
+        }
+    }
+
+    fn remove_min(&mut self) -> KV<K, V> {
+        match self {
+            Self::Branch(branch) => {
+                let (k, c) = branch.remove_min();
+                KV::Branch(k, c)
+            }
+            Self::Leaf(leaf) => {
+                let (k, v) = leaf.remove_min();
+                KV::Leaf(k, v)
+            }
         }
     }
 }
@@ -127,6 +168,12 @@ struct LeafNode<K, V> {
 }
 
 impl<K: NodeKeyType, V> LeafNode<K, V> {
+    fn remove_min(&mut self) -> (K, V) {
+        return (self.keys.remove(0), self.values.remove(0));
+    }
+    fn remove_max(&mut self) -> (K, V) {
+        return (self.keys.pop().unwrap(), self.values.pop().unwrap());
+    }
     fn new(branch_factor: usize) -> Self {
         LeafNode {
             keys: vec![],
@@ -186,6 +233,9 @@ impl<K: NodeKeyType, V> LeafNode<K, V> {
         }
     }
 
+    fn num_keys(&self) -> usize {
+        self.keys.len()
+    }
     fn find(&self, key: &K) -> Result<&V, BtreeError<K, V>> {
         match self.keys.binary_search(key) {
             Ok(index) => Ok(&self.values[index]),
@@ -202,7 +252,27 @@ struct BranchNode<K, V> {
     branch_factor: usize,
 }
 
+impl<K, V> Into<Node<K, V>> for LeafNode<K, V> {
+    fn into(self) -> Node<K, V> {
+        Node::Leaf(self)
+    }
+}
+
+impl<K, V> Into<Node<K, V>> for BranchNode<K, V> {
+    fn into(self) -> Node<K, V> {
+        Node::Branch(self)
+    }
+}
 impl<K: NodeKeyType, V> BranchNode<K, V> {
+    fn remove_min(&mut self) -> (K, Node<K, V>) {
+        (self.keys.remove(0), self.children.remove(0))
+    }
+    fn remove_max(&mut self) -> (K, Node<K, V>) {
+        (self.keys.pop().unwrap(), self.children.pop().unwrap())
+    }
+    fn num_keys(&self) -> usize {
+        self.keys.len()
+    }
     fn new(branch_factor: usize) -> Self {
         BranchNode {
             keys: vec![],
@@ -270,8 +340,99 @@ impl<K: NodeKeyType, V> BranchNode<K, V> {
         self.maybe_split()
     }
 
+    fn handle_leaf_undeflow(&mut self, index: usize) {
+        // If there's an underflow in leaf, we first check if a key,value pair can be
+        // moved to the undeflow node. If not (because it will cause undeflow in the
+        // neighbor), we merge the 2 nodes. In either case, the key of the current
+        // node changes to account for the move/merge.
+
+        if index > 0 {
+            // borrow/merge using left child
+            if self.children[index - 1].num_keys() > (self.branch_factor - 1) / 2 {
+                match self.children[index - 1] {
+                    Node::Leaf(ref mut leaf) => {
+                        let (k, v) = leaf.remove_max();
+                        let leaf_key = leaf.max_key().clone();
+                        self.children[index].insert(k.clone(), v).ok();
+                        if index < self.keys.len() - 1 {
+                            self.keys[index - 1] = leaf_key;
+                        }
+                    }
+                    _ => panic!("unexpected branch node for leaf child"),
+                }
+            } else {
+                // borrowing from left would cause underflow, need to merge
+                let mut underflow_child = self.children.remove(index);
+                self.keys.remove(index - 1);
+
+                let left_leaf = match self.children[index - 1] {
+                    Node::Leaf(ref mut leaf) => leaf,
+                    _ => panic!("expected leaf node"),
+                };
+                let underflow_leaf = match underflow_child {
+                    Node::Leaf(ref mut leaf) => leaf,
+                    _ => panic!("expected leaf node"),
+                };
+
+                left_leaf.keys.append(&mut underflow_leaf.keys);
+                left_leaf.values.append(&mut underflow_leaf.values);
+                if index < self.keys.len() - 1 {
+                    self.keys[index - 1] = left_leaf.max_key().clone();
+                }
+            }
+        } else {
+            // borrow/merge using right child
+            if self.children[index + 1].num_keys() > (self.branch_factor - 1) / 2 {
+                match self.children[index + 1] {
+                    Node::Leaf(ref mut leaf) => {
+                        let (k, v) = leaf.remove_min();
+                        self.children[index].insert(k.clone(), v).ok();
+                        self.keys[index] = k;
+                    }
+                    _ => panic!("expected leaf node"),
+                }
+            } else {
+                let mut borrow_child = self.children.remove(index + 1);
+                self.keys.remove(index);
+                let left_leaf = match self.children[index] {
+                    Node::Leaf(ref mut leaf) => leaf,
+                    _ => panic!("expected leaf node"),
+                };
+                let borrow_leaf = match borrow_child {
+                    Node::Leaf(ref mut leaf) => leaf,
+                    _ => panic!("expected leaf node"),
+                };
+                left_leaf.keys.append(&mut borrow_leaf.keys);
+                left_leaf.values.append(&mut borrow_leaf.values);
+            }
+        }
+    }
+
+    fn handle_branch_underflow(&mut self, index: usize) {}
+
+    fn handle_underflow(&mut self, index: usize) {
+        match &self.children[index] {
+            Node::Leaf(_) => self.handle_leaf_undeflow(index),
+            _ => self.handle_branch_underflow(index),
+        }
+    }
+
     fn remove_key(&mut self, key: &K) -> Result<V, BtreeError<K, V>> {
-        Err(BtreeError::KeyNotFound)
+        let (index, remove_key_result) = match self.keys.binary_search(key) {
+            Ok(index) | Err(index) => (index, self.children[index].remove_key(key)),
+        };
+
+        match remove_key_result {
+            Err(BtreeError::NodeUnderflow(v)) => {
+                self.handle_underflow(index);
+                if self.keys.len() < (self.branch_factor - 1) / 2 {
+                    Err(BtreeError::NodeUnderflow(v))
+                } else {
+                    Ok(v)
+                }
+            }
+            res @ _ => res,
+        }
     }
 
     fn find(&self, key: &K) -> Result<&V, BtreeError<K, V>> {
@@ -408,6 +569,55 @@ fn branch_find() {
     assert!(branch_node.find(&5).is_err());
     assert_eq!(BtreeError::KeyNotFound, branch_node.find(&5).err().unwrap());
     assert_eq!(&2, branch_node.find(&2).ok().unwrap());
+}
+
+#[test]
+fn branch_handle_underflow_left_child() {
+    let mut btree: BTree<i32, i32> = BTree::new(2);
+    btree.insert(1, 1);
+    btree.insert(2, 2);
+    btree.insert(3, 3); // splits into a branch node
+
+    let mut root_node = std::mem::replace(&mut btree.root, Node::Leaf(LeafNode::new(4)));
+    let branch_node = match root_node {
+        Node::Branch(ref mut b) => b,
+        _ => panic!("unexpected node type"),
+    };
+
+    assert_eq!(1, branch_node.keys.len());
+    let res = branch_node.remove_key(&1);
+    assert!(res.is_ok());
+    assert!(branch_node.find(&1).is_err());
+    assert_eq!(1, branch_node.keys.len());
+    assert_eq!(2, branch_node.children.len());
+}
+
+#[test]
+fn branch_handle_underflow_right_child() {
+    let mut btree: BTree<i32, i32> = BTree::new(2);
+    btree.insert(1, 1);
+    btree.insert(2, 2);
+    btree.insert(3, 3); // splits into a branch node
+    btree.insert(4, 4); // leaf node splits into [(1), (2), (3, 4)]
+
+    let mut root_node = std::mem::replace(&mut btree.root, Node::Leaf(LeafNode::new(4)));
+    let branch_node = match root_node {
+        Node::Branch(ref mut b) => b,
+        _ => panic!("unexpected node type"),
+    };
+
+    assert_eq!(2, branch_node.keys.len());
+    assert_eq!(3, branch_node.children.len());
+
+    let res = branch_node.remove_key(&3);
+    assert!(res.is_ok());
+    let res = branch_node.remove_key(&4);
+    assert!(res.is_ok());
+    assert!(branch_node.find(&3).is_err());
+    assert!(branch_node.find(&4).is_err());
+
+    assert_eq!(1, branch_node.keys.len());
+    assert_eq!(2, branch_node.children.len());
 }
 
 fn main() {
