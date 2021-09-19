@@ -340,6 +340,49 @@ impl<K: NodeKeyType, V> BranchNode<K, V> {
         self.maybe_split()
     }
 
+    fn leaf_borrow_from_left(&mut self, left: usize, key: usize, right: usize) {
+        // TODO(gopik): Instead of borrowing just one, we should borrow as many as possible
+        // while maintaining the invariants
+        // Borrow from left child and move into right
+        // Update the key @index
+        match self.children[left] {
+            Node::Leaf(ref mut leaf) => {
+                let (k, v) = leaf.remove_max();
+                let leaf_key = leaf.max_key().clone();
+                self.children[right].insert(k.clone(), v).ok();
+                self.keys[key] = leaf_key;
+            }
+            _ => panic!("unexpected branch node for leaf child"),
+        }
+    }
+
+    fn leaf_merge(&mut self, left: usize, key: usize, right: usize) {
+        let mut underflow_child = self.children.remove(right);
+        self.keys.remove(key);
+        let left_leaf = match self.children[left] {
+            Node::Leaf(ref mut leaf) => leaf,
+            _ => panic!("expected leaf node"),
+        };
+        let underflow_leaf = match underflow_child {
+            Node::Leaf(ref mut leaf) => leaf,
+            _ => panic!("expected leaf node"),
+        };
+
+        left_leaf.keys.append(&mut underflow_leaf.keys);
+        left_leaf.values.append(&mut underflow_leaf.values);
+    }
+
+    fn leaf_borrow_from_right(&mut self, left: usize, key: usize, right: usize) {
+        match self.children[right] {
+            Node::Leaf(ref mut leaf) => {
+                let (k, v) = leaf.remove_min();
+                self.children[left].insert(k.clone(), v).ok();
+                self.keys[key] = k;
+            }
+            _ => panic!("expected leaf node"),
+        }
+    }
+
     fn handle_leaf_undeflow(&mut self, index: usize) {
         // If there's an underflow in leaf, we first check if a key,value pair can be
         // moved to the undeflow node. If not (because it will cause undeflow in the
@@ -349,66 +392,101 @@ impl<K: NodeKeyType, V> BranchNode<K, V> {
         if index > 0 {
             // borrow/merge using left child
             if self.children[index - 1].num_keys() > (self.branch_factor - 1) / 2 {
-                match self.children[index - 1] {
-                    Node::Leaf(ref mut leaf) => {
-                        let (k, v) = leaf.remove_max();
-                        let leaf_key = leaf.max_key().clone();
-                        self.children[index].insert(k.clone(), v).ok();
-                        if index < self.keys.len() - 1 {
-                            self.keys[index - 1] = leaf_key;
-                        }
-                    }
-                    _ => panic!("unexpected branch node for leaf child"),
-                }
+                self.leaf_borrow_from_left(index - 1, index - 1, index)
             } else {
                 // borrowing from left would cause underflow, need to merge
-                let mut underflow_child = self.children.remove(index);
-                self.keys.remove(index - 1);
-
-                let left_leaf = match self.children[index - 1] {
-                    Node::Leaf(ref mut leaf) => leaf,
-                    _ => panic!("expected leaf node"),
-                };
-                let underflow_leaf = match underflow_child {
-                    Node::Leaf(ref mut leaf) => leaf,
-                    _ => panic!("expected leaf node"),
-                };
-
-                left_leaf.keys.append(&mut underflow_leaf.keys);
-                left_leaf.values.append(&mut underflow_leaf.values);
-                if index < self.keys.len() - 1 {
-                    self.keys[index - 1] = left_leaf.max_key().clone();
-                }
+                self.leaf_merge(index - 1, index - 1, index)
             }
         } else {
             // borrow/merge using right child
             if self.children[index + 1].num_keys() > (self.branch_factor - 1) / 2 {
-                match self.children[index + 1] {
-                    Node::Leaf(ref mut leaf) => {
-                        let (k, v) = leaf.remove_min();
-                        self.children[index].insert(k.clone(), v).ok();
-                        self.keys[index] = k;
-                    }
-                    _ => panic!("expected leaf node"),
-                }
+                self.leaf_borrow_from_right(index, index, index + 1);
             } else {
-                let mut borrow_child = self.children.remove(index + 1);
-                self.keys.remove(index);
-                let left_leaf = match self.children[index] {
-                    Node::Leaf(ref mut leaf) => leaf,
-                    _ => panic!("expected leaf node"),
-                };
-                let borrow_leaf = match borrow_child {
-                    Node::Leaf(ref mut leaf) => leaf,
-                    _ => panic!("expected leaf node"),
-                };
-                left_leaf.keys.append(&mut borrow_leaf.keys);
-                left_leaf.values.append(&mut borrow_leaf.values);
+                self.leaf_merge(index, index, index + 1);
             }
         }
     }
 
-    fn handle_branch_underflow(&mut self, index: usize) {}
+    fn branch_borrow_from_left(&mut self, left: usize, key: usize, right: usize) {
+        // TODO(gopik): Instead of borrowing just one, we should borrow as many as possible
+        // remove_max returns the last key and last child of the branch node. Hence child has
+        // keys which are larger than the key. The key for the branch node in self is larger
+        // than all keys in the children.
+        // To move over this key from left branch child, we move the self.key into right branch child
+        // and make the child left child of this key.
+        // The key from left branch child replaces the self key.
+        match self.children[left] {
+            Node::Branch(ref mut branch) => {
+                let (k, child) = branch.remove_max();
+
+                match self.children[right] {
+                    Node::Branch(ref mut right_branch) => {
+                        right_branch.keys.insert(0, self.keys[key].clone());
+                        right_branch.children.insert(0, child);
+                    }
+
+                    _ => panic!("unexpected branch node for leaf child"),
+                }
+                self.keys[key] = k;
+            }
+            _ => panic!("unexpected branch node for leaf child"),
+        }
+    }
+    fn branch_merge(&mut self, left: usize, key: usize, right: usize) {
+        let mut underflow_child = self.children.remove(right);
+        self.keys.remove(key);
+        let left_branch = match self.children[left] {
+            Node::Branch(ref mut branch) => branch,
+            _ => panic!("expected leaf node"),
+        };
+        let underflow_branch = match underflow_child {
+            Node::Branch(ref mut branch) => branch,
+            _ => panic!("expected leaf node"),
+        };
+
+        left_branch.keys.append(&mut underflow_branch.keys);
+        left_branch.children.append(&mut underflow_branch.children);
+    }
+
+    fn branch_borrow_from_right(&mut self, left: usize, key: usize, right: usize) {
+        // remove_min gives the right_key and it's left child of right key. Say key is the self key.
+        // hence  right_key >  left_child > key
+        // To move this entry to left child if key, we make right_key the self key and append key and
+        // left_child to left child of self_key
+
+        match self.children[right] {
+            Node::Branch(ref mut branch) => {
+                let (k, child) = branch.remove_min();
+                match self.children[left] {
+                    Node::Branch(ref mut left_branch) => {
+                        left_branch.keys.push(self.keys[key].clone());
+                        left_branch.children.push(child);
+                    }
+                    _ => panic!("expected leaf node"),
+                }
+                self.keys[key] = k;
+            }
+            _ => panic!("expected leaf node"),
+        }
+    }
+    fn handle_branch_underflow(&mut self, index: usize) {
+        if index > 0 {
+            // borrow/merge using left child
+            if self.children[index - 1].num_keys() > (self.branch_factor - 1) / 2 {
+                self.branch_borrow_from_left(index - 1, index - 1, index)
+            } else {
+                // borrowing from left would cause underflow, need to merge
+                self.leaf_merge(index - 1, index - 1, index)
+            }
+        } else {
+            // borrow/merge using right child
+            if self.children[index + 1].num_keys() > (self.branch_factor - 1) / 2 {
+                self.branch_borrow_from_right(index, index, index + 1);
+            } else {
+                self.branch_merge(index, index, index + 1);
+            }
+        }
+    }
 
     fn handle_underflow(&mut self, index: usize) {
         match &self.children[index] {
